@@ -148,6 +148,7 @@ class CivitAIReference:
     model_id: str | None = None
     version_id: str | None = None
     file_id: str | None = None
+    all_files: bool = False
 
 
 @dataclass(frozen=True)
@@ -226,6 +227,32 @@ def parse_civitai_reference(value: str) -> CivitAIReference:
             model_id=air_match.group("model"),
             version_id=air_match.group("version"),
             file_id=air_match.group("file"),
+        )
+
+    version_all_match = re.fullmatch(
+        r"(?:version\s*:\s*)?(?P<version>[1-9]\d*)\+all",
+        original,
+        flags=re.IGNORECASE,
+    )
+    if version_all_match:
+        return CivitAIReference(
+            original=original,
+            kind="version",
+            version_id=version_all_match.group("version"),
+            all_files=True,
+        )
+
+    version_file_match = re.fullmatch(
+        r"(?:version\s*:\s*)?(?P<version>[1-9]\d*)\+(?P<file>[1-9]\d*)",
+        original,
+        flags=re.IGNORECASE,
+    )
+    if version_file_match:
+        return CivitAIReference(
+            original=original,
+            kind="version",
+            version_id=version_file_match.group("version"),
+            file_id=version_file_match.group("file"),
         )
 
     explicit_match = re.fullmatch(
@@ -505,8 +532,35 @@ class CivitAIDownloader:
         )
         return self._resolve_version_reference(version_reference)
 
+    def resolve_version_files(self, identifier: str) -> tuple[ResolvedCivitAIResource, ...]:
+        """Resolve every downloadable file belonging to one explicit version."""
+        reference = parse_civitai_reference(identifier)
+        if reference.kind not in ("version", "air", "auto"):
+            raise IdentifierError("--all requires a CivitAI version ID or version URL")
+        if reference.file_id:
+            raise IdentifierError("--all cannot be combined with a specific file ID")
+
+        version_id = reference.version_id
+        if not version_id:
+            raise IdentifierError("--all requires a CivitAI model version ID")
+        version_data = self._fetch_version(version_id)
+        if version_data is None:
+            raise IdentifierError(f"CivitAI model version {version_id} was not found")
+
+        files = version_data.get("files") or []
+        if not files:
+            raise IdentifierError(f"CivitAI version {version_id} has no downloadable files")
+        return tuple(
+            self._resource_from_file(reference, version_data, file_data)
+            for file_data in files
+        )
+
     def resolve_identifier(self, identifier: str) -> ResolvedCivitAIResource:
         reference = parse_civitai_reference(identifier)
+        if reference.all_files:
+            raise IdentifierError(
+                "VERSION+all selects every file; use download_all() or the CLI directly"
+            )
         if reference.kind == "model":
             return self._resolve_model_reference(reference)
         if reference.kind in ("version", "air"):
@@ -1048,6 +1102,41 @@ class CivitAIDownloader:
         )
         return outcome
 
+    def download_all(
+        self,
+        identifier: str,
+        force: bool = False,
+    ) -> tuple[DownloadOutcome, ...]:
+        resources = self.resolve_version_files(identifier)
+        outcomes: list[DownloadOutcome] = []
+        self.logger.info(
+            "resolve_all",
+            version=resources[0].version_id,
+            files=len(resources),
+        )
+        for index, resource in enumerate(resources, start=1):
+            self.logger.info(
+                "resolve",
+                item=f"{index}/{len(resources)}",
+                model=resource.model_id,
+                version=resource.version_id,
+                file=resource.file_id,
+                name=resource.filename,
+                format=resource.file_format,
+            )
+            outcome = self._download_resource(resource, force=force)
+            outcomes.append(outcome)
+            self.logger.success(
+                "ready",
+                item=f"{index}/{len(resources)}",
+                status=outcome.status,
+                bytes=outcome.size_bytes,
+                sha256=outcome.sha256,
+                files=len(outcome.artifacts),
+                path=outcome.path,
+            )
+        return tuple(outcomes)
+
     def download_with_aria2(
         self,
         identifier: str,
@@ -1074,13 +1163,17 @@ def get_token(args_token: str | None) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download and verify one exact CivitAI model file",
+        description="Download and verify CivitAI model files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s -m 3268303
   %(prog)s -m model:2834417
   %(prog)s -m version:3268303
+  %(prog)s -m 3268303+3152083
+  %(prog)s -m version:3268303+3152083
+  %(prog)s -m 3268303+all
+  %(prog)s -m 3268303 -a
   %(prog)s -m 'civitai:2834417@3268303+3152083'
   %(prog)s -m 'https://civitai.com/models/2834417?modelVersionId=3268303'
         """,
@@ -1093,7 +1186,7 @@ Examples:
         dest="identifier",
         required=True,
         metavar="IDENTIFIER",
-        help="CivitAI model/version ID, model URL, download URL, or AIR",
+        help="CivitAI model/version ID, VERSION+FILE, VERSION+all, model URL, download URL, or AIR",
     )
     parser.add_argument("-o", "--output", default=".", help="output directory")
     parser.add_argument(
@@ -1102,6 +1195,12 @@ Examples:
         help="CivitAI API token; CIVITAI_TOKEN is safer and preferred",
     )
     parser.add_argument("--filename", help="safe filename override, without a path")
+    parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="download every file from the specified version",
+    )
     parser.add_argument(
         "--force", action="store_true", help="replace this exact verified target"
     )
@@ -1115,7 +1214,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         downloader = CivitAIDownloader(
             get_token(args.token), args.output, logger=logger
         )
-        downloader.download(args.identifier, args.filename, force=args.force)
+        reference = parse_civitai_reference(args.identifier)
+        download_all = args.all or reference.all_files
+        if args.all and reference.file_id:
+            raise IdentifierError("--all cannot be combined with a specific file ID")
+        if download_all:
+            if args.filename:
+                raise IdentifierError(
+                    "--filename cannot be used when downloading all version files"
+                )
+            downloader.download_all(args.identifier, force=args.force)
+        else:
+            downloader.download(args.identifier, args.filename, force=args.force)
         return 0
     except DownloaderError as exc:
         logger.error("failure", stage=exc.stage, message=exc)
